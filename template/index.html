@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NewsAnchor Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+</head>
+<body class="bg-slate-900 text-white min-h-screen font-sans">
+
+    <!-- Navbar -->
+    <nav class="border-b border-slate-800 p-4 bg-slate-900 sticky top-0 z-10">
+        <div class="max-w-5xl mx-auto flex justify-between items-center">
+            <div class="flex items-center gap-2">
+                <div class="bg-indigo-600 p-2 rounded-lg">
+                    <i class="fas fa-anchor text-white"></i>
+                </div>
+                <h1 class="text-xl font-bold tracking-tight">NEWS<span class="text-indigo-500">ANCHOR</span></h1>
+            </div>
+            <div class="flex gap-4">
+                <button onclick="fetchNews()" id="fetchBtn" class="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg font-medium transition-all flex items-center gap-2">
+                    <i class="fas fa-sync-alt" id="syncIcon"></i> Fetch News
+                </button>
+            </div>
+        </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="max-w-5xl mx-auto p-6">
+        <div class="mb-8">
+            <h2 class="text-3xl font-bold mb-2">Content Queue</h2>
+            <p class="text-slate-400">Fetch the latest tech news and choose which one to publish to your Buffer account.</p>
+        </div>
+
+        <!-- Loading State -->
+        <div id="loading" class="hidden flex flex-col items-center justify-center py-20">
+            <div class="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-indigo-500 mb-4"></div>
+            <p class="text-slate-400">Scanning NewsAPI...</p>
+        </div>
+
+        <!-- Empty State -->
+        <div id="empty" class="text-center py-20 bg-slate-800/50 rounded-2xl border-2 border-dashed border-slate-700">
+            <i class="fas fa-newspaper text-4xl text-slate-600 mb-4"></i>
+            <p class="text-slate-400">No news loaded. Click "Fetch News" to begin.</p>
+        </div>
+
+        <!-- News Grid -->
+        <div id="newsGrid" class="grid gap-4 grid-cols-1 md:grid-cols-2">
+            <!-- Cards injected by JS -->
+        </div>
+    </main>
+
+    <script>
+        async function fetchNews() {
+            const btn = document.getElementById('fetchBtn');
+            const icon = document.getElementById('syncIcon');
+            const loading = document.getElementById('loading');
+            const empty = document.getElementById('empty');
+            const grid = document.getElementById('newsGrid');
+
+            // UI State: Loading
+            btn.disabled = true;
+            icon.classList.add('animate-spin');
+            loading.classList.remove('hidden');
+            empty.classList.add('hidden');
+            grid.innerHTML = '';
+
+            try {
+                const response = await fetch('/api/fetch-news');
+                const data = await response.json();
+
+                if (data.articles && data.articles.length > 0) {
+                    data.articles.forEach(art => {
+                        const card = document.createElement('div');
+                        card.className = "bg-slate-800 border border-slate-700 p-5 rounded-xl hover:border-indigo-500 transition-all group";
+                        card.innerHTML = `
+                            <div class="flex justify-between items-start gap-4">
+                                <div class="flex-1">
+                                    <h3 class="font-bold text-lg mb-2 group-hover:text-indigo-400 transition-colors">${art.title}</h3>
+                                    <a href="${art.url}" target="_blank" class="text-sm text-slate-400 hover:underline break-all">${art.url}</a>
+                                </div>
+                                <button onclick="postNews('${art.url}', '${art.title.replace(/'/g, "\\'")}')" 
+                                        class="bg-slate-700 hover:bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-bold transition-all flex items-center gap-2 shrink-0">
+                                    <i class="fas fa-paper-plane"></i> Post
+                                </button>
+                            </div>
+                        `;
+                        grid.appendChild(card);
+                    });
+                } else {
+                    empty.classList.remove('hidden');
+                    empty.querySelector('p').innerText = "No new articles found.";
+                }
+            } catch (err) {
+                alert("Error fetching news: " + err);
+                empty.classList.remove('hidden');
+            } finally {
+                btn.disabled = false;
+                icon.classList.remove('animate-spin');
+                loading.classList.add('hidden');
+            }
+        }
+
+        async function postNews(url, title) {
+            if (!confirm(`Post this to Buffer?\n\n${title}`)) return;
+
+            try {
+                const response = await fetch('/api/post-news', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url, title })
+                });
+                const data = await response.json();
+
+                if (data.status === 'success') {
+                    alert("✅ Posted successfully!");
+                    fetchNews(); // Refresh list to remove posted article
+                } else {
+                    alert("❌ Error: " + (data.details || "Unknown error"));
+                }
+            } catch (err) {
+                alert("Network error occurred.");
+            }
+        }
+    </script>
+</body>
+</html>
