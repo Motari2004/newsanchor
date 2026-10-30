@@ -19,6 +19,30 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+# --- NEW SETUP FUNCTION ---
+@app.route('/setup-db')
+def setup_db():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # This creates the table if it doesn't exist
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                article_id BIGINT UNIQUE,
+                title TEXT,
+                url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"status": "success", "message": "Table 'posts' created successfully!"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "details": str(e)}), 500
+# ---------------------------
+
 def fetch_and_publish():
     try:
         url = f"https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey={NEWS_API_KEY}"
@@ -65,7 +89,6 @@ def dashboard():
 
 @app.route('/api')
 def cron_trigger():
-    # Security check removed
     return jsonify(fetch_and_publish()), 200
 
 @app.route('/manual-post', methods=['POST'])
