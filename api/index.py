@@ -19,13 +19,11 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-# --- NEW SETUP FUNCTION ---
 @app.route('/setup-db')
 def setup_db():
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        # This creates the table if it doesn't exist
         cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id SERIAL PRIMARY KEY,
@@ -41,10 +39,10 @@ def setup_db():
         return jsonify({"status": "success", "message": "Table 'posts' created successfully!"}), 200
     except Exception as e:
         return jsonify({"status": "error", "details": str(e)}), 500
-# ---------------------------
 
 def fetch_and_publish():
     try:
+        # 1. Get News
         url = f"https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey={NEWS_API_KEY}"
         response = requests.get(url).json()
         if response.get("status") != "ok":
@@ -59,6 +57,7 @@ def fetch_and_publish():
         url_link = article.get("url")
         article_id = hash(url_link)
 
+        # 2. Check Database
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT id FROM posts WHERE article_id = %s", (article_id,))
@@ -68,18 +67,60 @@ def fetch_and_publish():
             conn.close()
             return {"status": "skipped", "message": f"Article already posted: {title}"}
 
-        buffer_payload = {"text": f"{title} \n\nRead more: {url_link}", "profile_ids": [BUFFER_CHANNEL_ID]}
-        buffer_headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}"}
-        buffer_res = requests.post("https://api.bufferapp.com/1/updates/create.json", json=buffer_payload, headers=buffer_headers)
+        # 3. Post to Buffer via GraphQL API (New Generation Key)
+        graphql_url = "https://api.bufferapp.com/graphql"
+        headers = {
+            "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
+            "Content-Type": "application/json"
+        }
+        
+        # GraphQL Mutation to create a post
+        mutation = """
+        mutation CreateUpdate($input: CreateUpdateInput!) {
+          createUpdate(input: $input) {
+            update {
+              id
+            }
+            errors {
+              message
+            }
+          }
+        }
+        """
+        
+        variables = {
+            "input": {
+                "profileIds": [BUFFER_CHANNEL_ID],
+                "text": f"{title} \n\nRead more: {url_link}",
+                "shortenUrl": True
+            }
+        }
 
-        if buffer_res.status_code == 200:
-            cur.execute("INSERT INTO posts (article_id, title, url) VALUES (%s, %s, %s)", (article_id, title, url_link))
-            conn.commit()
+        buffer_res = requests.post(
+            graphql_url, 
+            json={"query": mutation, "variables": variables}, 
+            headers=headers
+        )
+
+        res_data = buffer_res.json()
+        
+        # Check for GraphQL errors
+        if "errors" in res_data:
             conn.close()
-            return {"status": "success", "message": f"Posted: {title}"}
-        else:
+            return {"error": "Buffer GraphQL Error", "details": res_data["errors"]}
+
+        # Check for business logic errors in the response
+        create_res = res_data.get("data", {}).get("createUpdate", {})
+        if create_res.get("errors"):
             conn.close()
-            return {"error": "Buffer API error", "details": buffer_res.text}
+            return {"error": "Buffer API Error", "details": create_res["errors"]}
+
+        # 4. Save to DB
+        cur.execute("INSERT INTO posts (article_id, title, url) VALUES (%s, %s, %s)", (article_id, title, url_link))
+        conn.commit()
+        conn.close()
+        return {"status": "success", "message": f"Posted: {title}"}
+
     except Exception as e:
         return {"error": "System crash", "details": str(e)}
 
