@@ -52,38 +52,42 @@ def fetch_and_publish():
         if not articles:
             return {"status": "no_news", "message": "No new articles found."}
 
-        article = articles[0] 
-        title = article.get("title")
-        url_link = article.get("url")
-        article_id = hash(url_link)
-
-        # 2. Check Database
+        # 2. FIND THE FIRST UNPOSTED ARTICLE
+        # Instead of just taking articles[0], we check the list until we find a new one
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT id FROM posts WHERE article_id = %s", (article_id,))
-        exists = cur.fetchone()
-
-        if exists:
+        
+        chosen_article = None
+        for art in articles:
+            url_link = art.get("url")
+            if not url_link: continue
+            article_id = hash(url_link)
+            
+            cur.execute("SELECT id FROM posts WHERE article_id = %s", (article_id,))
+            if not cur.fetchone():
+                chosen_article = art
+                break
+        
+        if not chosen_article:
             conn.close()
-            return {"status": "skipped", "message": f"Article already posted: {title}"}
+            return {"status": "skipped", "message": "All current top headlines have already been posted."}
 
-        # 3. Post to Buffer via GraphQL API (New Generation Key)
+        title = chosen_article.get("title")
+        url_link = chosen_article.get("url")
+        article_id = hash(url_link)
+
+        # 3. Post to Buffer via GraphQL API
         graphql_url = "https://api.bufferapp.com/graphql"
         headers = {
             "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
             "Content-Type": "application/json"
         }
         
-        # GraphQL Mutation to create a post
         mutation = """
         mutation CreateUpdate($input: CreateUpdateInput!) {
           createUpdate(input: $input) {
-            update {
-              id
-            }
-            errors {
-              message
-            }
+            update { id }
+            errors { message }
           }
         }
         """
@@ -104,12 +108,10 @@ def fetch_and_publish():
 
         res_data = buffer_res.json()
         
-        # Check for GraphQL errors
         if "errors" in res_data:
             conn.close()
             return {"error": "Buffer GraphQL Error", "details": res_data["errors"]}
 
-        # Check for business logic errors in the response
         create_res = res_data.get("data", {}).get("createUpdate", {})
         if create_res.get("errors"):
             conn.close()
