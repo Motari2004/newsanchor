@@ -6,7 +6,15 @@ from flask import Flask, render_template, jsonify, request
 from dotenv import load_dotenv
 
 load_dotenv()
-app = Flask(__name__, template_folder='../templates')
+
+# --- SAFETY FOLDER LOGIC ---
+# Ensures Flask finds index.html regardless of Vercel's internal pathing
+current_dir = os.path.dirname(os.path.abspath(__file__))
+template_dir = os.path.join(current_dir, '..', 'template') 
+if not os.path.exists(template_dir):
+    template_dir = os.path.join(current_dir, '..', 'templates')
+
+app = Flask(__name__, template_folder=template_dir)
 
 # Config
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
@@ -17,9 +25,35 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
+# --- AUTO-SETUP DATABASE ---
+def initialize_db():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                article_id BIGINT UNIQUE,
+                title TEXT,
+                url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"DB Init Error: {e}")
+
+# Run initialization on startup
+initialize_db()
+
 @app.route('/')
 def dashboard():
-    return render_template('index.html')
+    try:
+        return render_template('index.html')
+    except Exception as e:
+        return f"Template Error: {str(e)}. Check if index.html is in the template folder.", 500
 
 @app.route('/api/fetch-news')
 def fetch_news():
@@ -60,16 +94,21 @@ def post_news():
         data = request.json
         title = data.get("title")
         url_link = data.get("url")
+        
+        if not title or not url_link:
+            return jsonify({"status": "error", "details": "Missing title or URL"}), 400
+            
         article_id = hash(url_link)
 
         # 1. Post to Buffer GraphQL
         graphql_url = "https://api.bufferapp.com/graphql"
         headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}", "Content-Type": "application/json"}
+        
         mutation = """
         mutation CreateUpdate($input: CreateUpdateInput!) {
-          createUpdate(input: $input) {
-            update { id }
-            errors { message }
+          createUpdate(input: $input) { 
+            update { id } 
+            errors { message } 
           }
         }
         """
@@ -84,32 +123,36 @@ def post_news():
         res = requests.post(graphql_url, json={"query": mutation, "variables": variables}, headers=headers)
         res_data = res.json()
 
+        # DEBUG: Check for top-level GraphQL errors (Auth/Syntax)
         if "errors" in res_data:
-            return jsonify({"status": "error", "details": res_data["errors"]}), 400
+            return jsonify({"status": "error", "details": f"GraphQL Error: {res_data['errors']}"}), 400
 
-        # 2. Save to Database
+        # DEBUG: Check for business-level errors (Channel ID/Permissions)
+        data_block = res_data.get("data", {})
+        create_update = data_block.get("createUpdate", {})
+        
+        if not create_update:
+            return jsonify({"status": "error", "details": "Buffer returned no data block"}), 500
+            
+        errors = create_update.get("errors")
+        if errors:
+            return jsonify({"status": "error", "details": f"Buffer API Error: {errors}"}), 400
+
+        # 2. Save to Database only if Buffer actually created the post
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("INSERT INTO posts (article_id, title, url) VALUES (%s, %s, %s)", (article_id, title, url_link))
         conn.commit()
         conn.close()
 
-        return jsonify({"status": "success", "message": f"Posted {title}"}), 200
+        return jsonify({"status": "success", "message": f"Successfully pushed to Buffer: {title}"}), 200
     except Exception as e:
         return jsonify({"status": "error", "details": str(e)}), 500
 
-# Keep the original /api route for your Cron job so it still works automatically
 @app.route('/api')
 def cron_trigger():
-    # Logic: Fetch one new and post it automatically
-    try:
-        news_data = fetch_news() # Internal call simulation
-        # Since fetch_news returns a Flask response, we'll just call the logic here
-        # For brevity, I'll keep the cron trigger simple:
-        # In a real production app, you'd move the logic to a shared function.
-        return jsonify({"message": "Cron trigger called. Use the Dashboard for manual control."}), 200
-    except:
-        return jsonify({"error": "failed"}), 500
+    # Simple trigger for cron tasks
+    return jsonify({"message": "Cron trigger called. Use Dashboard for manual control."}), 200
 
 def handler(request, context):
     return app(request, context)
