@@ -8,14 +8,13 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-app = Flask(__name__, template_folder='../templates') # Tell Flask templates are one level up
+app = Flask(__name__, template_folder='../templates')
 
 # Configuration from .env
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")
 BUFFER_ACCESS_TOKEN = os.getenv("BUFFER_ACCESS_TOKEN")
 BUFFER_CHANNEL_ID = os.getenv("BUFFER_CHANNEL_ID")
 DATABASE_URL = os.getenv("DATABASE_URL")
-CRON_SECRET = os.getenv("CRON_SECRET")
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -66,9 +65,7 @@ def dashboard():
 
 @app.route('/api')
 def cron_trigger():
-    provided_secret = request.args.get("secret")
-    if provided_secret != CRON_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+    # Security check removed
     return jsonify(fetch_and_publish()), 200
 
 @app.route('/manual-post', methods=['POST'])
@@ -87,6 +84,5 @@ def get_logs():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# IMPORTANT: This is the part Vercel uses
 def handler(request, context):
     return app(request, context)
