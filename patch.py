@@ -1,130 +1,62 @@
 import os
 
-# The path to your API file
 FILE_PATH = "api/index.py"
 
-# The old function block we are looking for (start and end markers)
-START_MARKER = "def fetch_and_publish():"
-END_MARKER = "except Exception as e:\n        return {\"error\": \"System crash\", \"details\": str(e)}"
+# We are replacing the entire auto_discover_profile function
+START_MARKER = "def auto_discover_profile():"
+END_MARKER = "except Exception as e:\n        print(f\"❌ Auto-discovery failed: {e}\")"
 
-# The new, improved function
-NEW_FUNCTION = """def fetch_and_publish():
+NEW_FUNCTION = """def auto_discover_profile():
+    \"\"\"Finds the REAL Numeric Profile ID using the correct endpoint with .env fallback\"\"\"
+    global BUFFER_CHANNEL_ID
+    
+    # Keep a copy of the .env ID in case the API fails
+    fallback_id = os.getenv("BUFFER_CHANNEL_ID")
+    
+    print("🔍 Auto-discovering Buffer Profile ID via api.buffer.com...")
+    
+    headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}", "Content-Type": "application/json"}
+    query = "{ me { profiles { id service username } } }"
+    
     try:
-        # 1. Get News
-        url = f"https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey={NEWS_API_KEY}"
-        response = requests.get(url).json()
-        if response.get("status") != "ok":
-            return {"error": "NewsAPI error", "details": response}
-
-        articles = response.get("articles", [])
-        if not articles:
-            return {"status": "no_news", "message": "No new articles found."}
-
-        # 2. FIND THE FIRST UNPOSTED ARTICLE
-        # Instead of just taking articles[0], we check the list until we find a new one
-        conn = get_db_connection()
-        cur = conn.cursor()
+        res = requests.post(BUFFER_API_URL, json={"query": query}, headers=headers)
+        res.raise_for_status()
+        data = res.json()
+        profiles = data.get("data", {}).get("me", {}).get("profiles", [])
         
-        chosen_article = None
-        for art in articles:
-            url_link = art.get("url")
-            if not url_link: continue
-            article_id = hash(url_link)
-            
-            cur.execute("SELECT id FROM posts WHERE article_id = %s", (article_id,))
-            if not cur.fetchone():
-                chosen_article = art
-                break
-        
-        if not chosen_article:
-            conn.close()
-            return {"status": "skipped", "message": "All current top headlines have already been posted."}
-
-        title = chosen_article.get("title")
-        url_link = chosen_article.get("url")
-        article_id = hash(url_link)
-
-        # 3. Post to Buffer via GraphQL API
-        graphql_url = "https://api.bufferapp.com/graphql"
-        headers = {
-            "Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}",
-            "Content-Type": "application/json"
-        }
-        
-        mutation = \"\"\"
-        mutation CreateUpdate($input: CreateUpdateInput!) {
-          createUpdate(input: $input) {
-            update { id }
-            errors { message }
-          }
-        }
-        \"\"\"
-        
-        variables = {
-            "input": {
-                "profileIds": [BUFFER_CHANNEL_ID],
-                "text": f"{title} \\n\\nRead more: {url_link}",
-                "shortenUrl": True
-            }
-        }
-
-        buffer_res = requests.post(
-            graphql_url, 
-            json={"query": mutation, "variables": variables}, 
-            headers=headers
-        )
-
-        res_data = buffer_res.json()
-        
-        if "errors" in res_data:
-            conn.close()
-            return {"error": "Buffer GraphQL Error", "details": res_data["errors"]}
-
-        create_res = res_data.get("data", {}).get("createUpdate", {})
-        if create_res.get("errors"):
-            conn.close()
-            return {"error": "Buffer API Error", "details": create_res["errors"]}
-
-        # 4. Save to DB
-        cur.execute("INSERT INTO posts (article_id, title, url) VALUES (%s, %s, %s)", (article_id, title, url_link))
-        conn.commit()
-        conn.close()
-        return {"status": "success", "message": f"Posted: {title}"}
-
+        if profiles:
+            BUFFER_CHANNEL_ID = profiles[0]['id']
+            print(f"✅ Auto-discovered Profile: {profiles[0]['service']} ({profiles[0]['username']})")
+            print(f"🚀 Using REAL ID: {BUFFER_CHANNEL_ID}")
+        else:
+            BUFFER_CHANNEL_ID = fallback_id
+            if BUFFER_CHANNEL_ID:
+                print("⚠️ No profiles found via API, using BUFFER_CHANNEL_ID from .env")
+            else:
+                print("❌ No connected profiles found in Buffer AND no fallback ID in .env")
     except Exception as e:
-        return {"error": "System crash", "details": str(e)}"""
+        BUFFER_CHANNEL_ID = fallback_id
+        print(f"❌ Auto-discovery failed: {e}. Falling back to .env ID: {BUFFER_CHANNEL_ID}")
+"""
 
-def apply_patch():
-    if not os.path.exists(FILE_PATH):
-        print(f"Error: {FILE_PATH} not found.")
-        return
-
-    with open(FILE_PATH, "r") as f:
+# FIX: Added encoding="utf-8" to handle emojis/special characters on Windows
+try:
+    with open(FILE_PATH, "r", encoding="utf-8") as f:
         content = f.read()
 
-    if START_MARKER not in content:
-        print("Error: Could not find the fetch_and_publish function to patch.")
-        return
-
-    # Find the boundaries of the function
-    start_idx = content.find(START_MARKER)
-    # Find the end of the function by looking for the matching error return block
-    end_idx = content.find(END_MARKER)
-    
-    if end_idx == -1:
-        print("Error: Could not find the end of the function.")
-        return
-    
-    # Extend end_idx to cover the whole error return block
-    end_idx += len(END_MARKER)
-
-    # Replace old function with new function
-    new_content = content[:start_idx] + NEW_FUNCTION + content[end_idx:]
-
-    with open(FILE_PATH, "w") as f:
-        f.write(new_content)
-
-    print("PATCH_OK")
-
-if __name__ == "__main__":
-    apply_patch()
+    parts = content.split(START_MARKER)
+    if len(parts) > 1:
+        after_start = parts[1].split(END_MARKER)
+        if len(after_start) > 1:
+            final_content = parts[0] + NEW_FUNCTION + after_start[1]
+            
+            # FIX: Added encoding="utf-8" here as well
+            with open(FILE_PATH, "w", encoding="utf-8") as f:
+                f.write(final_content)
+            print("PATCH_OK")
+        else:
+            print("Could not find END_MARKER. Check if the file content matches the original exactly.")
+    else:
+        print("Could not find START_MARKER. Check if the function 'def auto_discover_profile():' exists.")
+except Exception as e:
+    print(f"An error occurred: {e}")
