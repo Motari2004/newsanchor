@@ -1,7 +1,7 @@
 import os
 import requests
 import psycopg2
-import hashlib  # Replaced random hash with stable hashlib
+import hashlib
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template, jsonify, request
 from dotenv import load_dotenv
@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
+# --- FOLDER LOGIC ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 template_dir = os.path.join(current_dir, '..', 'template') 
 if not os.path.exists(template_dir):
@@ -32,6 +33,7 @@ NEWS_TOPICS = [
     {"name": "Health", "params": "category=health"},
     {"name": "Kenyan News", "params": "q=Kenya OR Nairobi"},
 ]
+# ============================================================
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -44,7 +46,7 @@ def initialize_db():
         cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id SERIAL PRIMARY KEY,
-                article_id TEXT UNIQUE, 
+                article_id TEXT UNIQUE,
                 title TEXT,
                 url TEXT,
                 is_published BOOLEAN DEFAULT FALSE,
@@ -84,11 +86,12 @@ def auto_discover_profile():
     except Exception as e:
         BUFFER_CHANNEL_ID = fallback_id
 
+# Run initialization
 initialize_db()
 auto_discover_profile()
 
 def generate_stable_id(url):
-    """Creates a unique ID that NEVER changes even if the server restarts"""
+    """Creates a unique ID that NEVER changes even if server restarts"""
     return hashlib.md5(url.encode('utf-8')).hexdigest()
 
 def perform_buffer_post(title, url):
@@ -122,24 +125,8 @@ def perform_buffer_post(title, url):
     except Exception as e:
         return False, str(e)
 
-@app.route('/')
-def dashboard():
-    return render_template('index.html')
-
-@app.route('/api/fetch-news')
-def fetch_news():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT title, url, error_log FROM posts WHERE is_published = FALSE ORDER BY fetched_at DESC")
-        articles = cur.fetchall()
-        conn.close()
-        return jsonify({"articles": articles}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 def run_sync_logic():
-    """Internal function to handle syncing without making HTTP requests to itself"""
+    """Internal function to sync news without making internal HTTP requests"""
     conn = get_db_connection()
     cur = conn.cursor()
     total_saved = 0
@@ -165,6 +152,22 @@ def run_sync_logic():
     conn.close()
     return total_saved
 
+@app.route('/')
+def dashboard():
+    return render_template('index.html')
+
+@app.route('/api/fetch-news')
+def fetch_news():
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT title, url, error_log FROM posts WHERE is_published = FALSE ORDER BY fetched_at DESC")
+        articles = cur.fetchall()
+        conn.close()
+        return jsonify({"articles": articles}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route('/api/cron/sync-news')
 def sync_news():
     try:
@@ -175,42 +178,62 @@ def sync_news():
 
 @app.route('/api/cron/publish-latest')
 def cron_publish():
+    """Finds and posts the first valid unposted article, skipping all duplicates in one go"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        one_day_ago = datetime.utcnow() - timedelta(hours=24)
-        cur.execute(
-            "SELECT id, title, url FROM posts WHERE is_published = FALSE AND fetched_at > %s ORDER BY fetched_at ASC LIMIT 1", 
-            (one_day_ago,)
-        )
-        target = cur.fetchone()
         
-        if not target:
-            conn.close()
-            run_sync_logic() # Call function directly, NOT via URL
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT id, title, url FROM posts WHERE is_published = FALSE ORDER BY fetched_at ASC LIMIT 1")
+        attempts = 0
+        max_attempts = 10 # Safety limit to prevent Vercel timeout
+        
+        while attempts < max_attempts:
+            attempts += 1
+            
+            one_day_ago = datetime.utcnow() - timedelta(hours=24)
+            cur.execute(
+                "SELECT id, title, url FROM posts WHERE is_published = FALSE AND fetched_at > %s ORDER BY fetched_at ASC LIMIT 1", 
+                (one_day_ago,)
+            )
             target = cur.fetchone()
             
-        if not target:
-            conn.close()
-            return jsonify({"status": "skipped", "message": "No news available to post"}), 200
+            if not target:
+                # No recent news, try to sync and search again
+                conn.close()
+                run_sync_logic() 
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT id, title, url FROM posts WHERE is_published = FALSE ORDER BY fetched_at ASC LIMIT 1")
+                target = cur.fetchone()
+                
+                if not target:
+                    conn.close()
+                    return jsonify({"status": "skipped", "message": "No news available to post"}), 200
 
-        success, msg = perform_buffer_post(target['title'], target['url'])
-        is_duplicate = "already got this one scheduled" in str(msg).lower() or "duplicate" in str(msg).lower()
-        
-        if success or is_duplicate:
-            status_msg = "Published" if success else "Skipped (Duplicate)"
-            cur.execute("UPDATE posts SET is_published = TRUE, error_log = %s WHERE id = %s", (msg, target['id']))
-            conn.commit()
-            conn.close()
-            return jsonify({"status": "success", "message": f"{status_msg}: {target['title']}"}), 200
-        else:
-            cur.execute("UPDATE posts SET error_log = %s WHERE id = %s", (msg, target['id']))
-            conn.commit()
-            conn.close()
-            return jsonify({"status": "error", "message": f"Buffer failed: {msg}"}), 500
+            # Attempt Buffer Post
+            success, msg = perform_buffer_post(target['title'], target['url'])
+            is_duplicate = "already got this one scheduled" in str(msg).lower() or "duplicate" in str(msg).lower()
+            
+            if is_duplicate:
+                # MARK AS DONE AND CONTINUE TO NEXT STORY
+                cur.execute("UPDATE posts SET is_published = TRUE, error_log = %s WHERE id = %s", (msg, target['id']))
+                conn.commit()
+                continue 
+            
+            if success:
+                # SUCCESS! Mark as published and exit
+                cur.execute("UPDATE posts SET is_published = TRUE, error_log = %s WHERE id = %s", (msg, target['id']))
+                conn.commit()
+                conn.close()
+                return jsonify({"status": "success", "message": f"Published: {target['title']}"}), 200
+            else:
+                # REAL ERROR - log and stop
+                cur.execute("UPDATE posts SET error_log = %s WHERE id = %s", (msg, target['id']))
+                conn.commit()
+                conn.close()
+                return jsonify({"status": "error", "message": f"Buffer failed: {msg}"}), 500
+
+        conn.close()
+        return jsonify({"status": "error", "message": "Reached max attempts skipping duplicates"}), 500
 
     except Exception as e:
         if 'conn' in locals(): conn.close()
