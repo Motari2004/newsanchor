@@ -1,6 +1,7 @@
 import os
 import requests
 import psycopg2
+import random
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template, jsonify, request
 from dotenv import load_dotenv
@@ -24,6 +25,14 @@ BUFFER_ACCESS_TOKEN = os.getenv("BUFFER_ACCESS_TOKEN", "YejnMy656UwVGgapzVDWIIkB
 BUFFER_API_URL = "https://api.buffer.com" 
 DATABASE_URL = os.getenv("DATABASE_URL")
 BUFFER_CHANNEL_ID = os.getenv("BUFFER_CHANNEL_ID") 
+
+# COMBINED NEWS TOPICS
+NEWS_TOPICS = [
+    {"name": "Technology", "params": "category=technology"},
+    {"name": "Hacking/Security", "params": "q=hacking OR 'cyber security' OR 'data breach'"},
+    {"name": "Health", "params": "category=health"},
+    {"name": "Kenyan News", "params": "q=Kenya OR Nairobi"},
+]
 # ============================================================
 
 def get_db_connection():
@@ -119,23 +128,35 @@ def dashboard():
 
 @app.route('/api/fetch-news')
 def fetch_news():
+    """Fetches a mix of news from all configured topics for the dashboard"""
     try:
-        url = f"https://newsapi.org/v2/top-headlines?sources=bbc-news&apiKey={NEWS_API_KEY}"
-        response = requests.get(url).json()
-        articles = response.get("articles", [])
-        if DATABASE_URL:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            available = []
+        all_available_articles = []
+        for topic in NEWS_TOPICS:
+            url = f"https://newsapi.org/v2/top-headlines?{topic['params']}&language=en&apiKey={NEWS_API_KEY}"
+            response = requests.get(url).json()
+            articles = response.get("articles", [])
+            
             for art in articles:
                 url_link = art.get("url")
                 if not url_link: continue
-                cur.execute("SELECT id FROM posts WHERE article_id = %s", (hash(url_link),))
-                if not cur.fetchone():
-                    available.append({"title": art.get("title"), "url": url_link, "urlToImage": art.get("urlToImage")})
-            conn.close()
-            return jsonify({"articles": available}), 200
-        return jsonify({"articles": articles}), 200
+                
+                if DATABASE_URL:
+                    conn = get_db_connection()
+                    cur = conn.cursor()
+                    cur.execute("SELECT id FROM posts WHERE article_id = %s", (hash(url_link),))
+                    exists = cur.fetchone()
+                    conn.close()
+                    if exists: continue
+
+                all_available_articles.append({
+                    "title": art.get("title"), 
+                    "url": url_link, 
+                    "urlToImage": art.get("urlToImage"),
+                    "topic": topic['name']
+                })
+        
+        random.shuffle(all_available_articles)
+        return jsonify({"articles": all_available_articles}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -154,21 +175,28 @@ def post_news():
     return jsonify({"status": "error", "details": msg}), 400
 
 # ============================================================
-# NEW: AUTOMATION ENDPOINT
+# AUTOMATION ENDPOINT (THE TRIGGER)
 # ============================================================
 @app.route('/api/cron/publish-latest')
 def cron_publish():
-    """Endpoint for external job: Finds 1 latest news from 24h, posts it, and marks it."""
+    """
+    Logic:
+    1. Pick a random topic from the mixed list.
+    2. Fetch news from the last 24 hours.
+    3. Check database to find the first article NOT yet published.
+    4. Post and mark as published.
+    """
     try:
-        # 1. Fetch latest technology news
-        url = f"https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey={NEWS_API_KEY}"
+        # 1. Pick a random topic for variety
+        selected_topic = random.choice(NEWS_TOPICS)
+        url = f"https://newsapi.org/v2/top-headlines?{selected_topic['params']}&language=en&apiKey={NEWS_API_KEY}"
         response = requests.get(url).json()
         articles = response.get("articles", [])
         
         if not articles:
-            return jsonify({"status": "error", "message": "No news found"}), 404
+            return jsonify({"status": "skipped", "message": f"No news found for {selected_topic['name']}"}), 200
 
-        # 2. Filter for articles from the last 24 hours and NOT in DB
+        # 2. Filter for articles from the last 24 hours
         now = datetime.utcnow()
         one_day_ago = now - timedelta(hours=24)
         
@@ -177,7 +205,7 @@ def cron_publish():
         
         target_article = None
         for art in articles:
-            # Parse NewsAPI date (Example: 2023-10-30T11:00:00Z)
+            # Date check
             pub_date_str = art.get("publishedAt", "").replace("Z", "")
             try:
                 pub_date = datetime.fromisoformat(pub_date_str)
@@ -185,17 +213,17 @@ def cron_publish():
                 continue
             
             if pub_date > one_day_ago:
-                # Check if already published in DB
+                # 3. Check Database for unposted status
                 cur.execute("SELECT id FROM posts WHERE article_id = %s", (hash(art.get("url")),))
                 if not cur.fetchone():
                     target_article = art
-                    break # Take the very first (latest) match
+                    break 
         
         if not target_article:
             conn.close()
-            return jsonify({"status": "skipped", "message": "No new articles in last 24h"}), 200
+            return jsonify({"status": "skipped", "message": f"No new unposted articles for {selected_topic['name']} in last 24h"}), 200
 
-        # 3. Post to Twitter
+        # 4. Post to Twitter via Buffer
         success, msg = perform_buffer_post(
             target_article.get("title"), 
             target_article.get("url"), 
@@ -203,12 +231,12 @@ def cron_publish():
         )
         
         if success:
-            # 4. Mark as published in DB
+            # 5. Mark as published in DB immediately
             cur.execute("INSERT INTO posts (article_id, title, url) VALUES (%s, %s, %s)", 
                         (hash(target_article.get("url")), target_article.get("title"), target_article.get("url")))
             conn.commit()
             conn.close()
-            return jsonify({"status": "success", "message": f"Published: {target_article.get('title')}"}), 200
+            return jsonify({"status": "success", "message": f"Published {selected_topic['name']}: {target_article.get('title')}"}), 200
         else:
             conn.close()
             return jsonify({"status": "error", "message": f"Buffer failed: {msg}"}), 500
