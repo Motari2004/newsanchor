@@ -43,7 +43,7 @@ def initialize_db():
         if not DATABASE_URL: return
         conn = get_db_connection()
         cur = conn.cursor()
-        # Added 'is_published' column to track what has been sent to Twitter
+        # Added 'error_log' column to diagnose failures in the DB
         cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id SERIAL PRIMARY KEY,
@@ -51,9 +51,15 @@ def initialize_db():
                 title TEXT,
                 url TEXT,
                 is_published BOOLEAN DEFAULT FALSE,
+                error_log TEXT,
                 fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # Add error_log column if it doesn't exist (for existing installs)
+        try:
+            cur.execute("ALTER TABLE posts ADD COLUMN error_log TEXT;")
+        except:
+            pass 
         conn.commit()
         cur.close()
         conn.close()
@@ -82,6 +88,7 @@ def auto_discover_profile():
     except Exception as e:
         BUFFER_CHANNEL_ID = fallback_id
 
+# Run initialization
 initialize_db()
 auto_discover_profile()
 
@@ -107,12 +114,15 @@ def perform_buffer_post(title, url):
             "mode": "shareNow"
         }
     }
-    res = requests.post(BUFFER_API_URL, json={"query": mutation, "variables": variables}, headers=headers)
-    res_data = res.json()
-    if "errors" in res_data: return False, res_data["errors"]
-    res_body = res_data.get("data", {}).get("createPost", {})
-    if "message" in res_body: return False, res_body["message"]
-    return True, "Success"
+    try:
+        res = requests.post(BUFFER_API_URL, json={"query": mutation, "variables": variables}, headers=headers, timeout=10)
+        res_data = res.json()
+        if "errors" in res_data: return False, res_data["errors"]
+        res_body = res_data.get("data", {}).get("createPost", {})
+        if "message" in res_body: return False, res_body["message"]
+        return True, "Success"
+    except Exception as e:
+        return False, str(e)
 
 @app.route('/')
 def dashboard():
@@ -120,23 +130,18 @@ def dashboard():
 
 @app.route('/api/fetch-news')
 def fetch_news():
-    """Dashboard view: shows all currently stored unposted news"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT title, url FROM posts WHERE is_published = FALSE ORDER BY fetched_at DESC")
+        cur.execute("SELECT title, url, error_log FROM posts WHERE is_published = FALSE ORDER BY fetched_at DESC")
         articles = cur.fetchall()
         conn.close()
         return jsonify({"articles": articles}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ============================================================
-# BULK SYNC ENDPOINT (Run this every 6-12 hours)
-# ============================================================
 @app.route('/api/cron/sync-news')
 def sync_news():
-    """Fetches news from ALL topics and saves them to DB if not already there"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -151,7 +156,6 @@ def sync_news():
                 url_link = art.get("url")
                 if not url_link: continue
                 
-                # Only insert if it doesn't exist in DB
                 cur.execute("SELECT id FROM posts WHERE article_id = %s", (hash(url_link),))
                 if not cur.fetchone():
                     cur.execute(
@@ -166,17 +170,13 @@ def sync_news():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-# ============================================================
-# PUBLISH ENDPOINT (Run this every 30 minutes)
-# ============================================================
 @app.route('/api/cron/publish-latest')
 def cron_publish():
-    """Finds ONE unposted article from the last 24h and posts it"""
+    """Finds ONE unposted article and handles duplicates gracefully"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # 1. Find the oldest unposted article from the last 24 hours
         one_day_ago = datetime.utcnow() - timedelta(hours=24)
         cur.execute(
             "SELECT id, title, url FROM posts WHERE is_published = FALSE AND fetched_at > %s ORDER BY fetched_at ASC LIMIT 1", 
@@ -185,12 +185,11 @@ def cron_publish():
         target = cur.fetchone()
         
         if not target:
-            # 2. If DB is empty, trigger a sync immediately so we have something to post
             conn.close()
-            print("DB empty or no fresh news. Triggering sync...")
-            requests.get(f"http://localhost:5000/api/cron/sync-news") # Adjust URL to your production URL
+            # Use environment variable for the base URL in production
+            base_url = request.host_url if request else "http://localhost:5000/"
+            requests.get(f"{base_url}api/cron/sync-news") 
             
-            # Try one more time after sync
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("SELECT id, title, url FROM posts WHERE is_published = FALSE ORDER BY fetched_at ASC LIMIT 1")
@@ -200,20 +199,28 @@ def cron_publish():
             conn.close()
             return jsonify({"status": "skipped", "message": "No news available to post"}), 200
 
-        # 3. Post to Buffer
+        # Post to Buffer
         success, msg = perform_buffer_post(target['title'], target['url'])
         
-        if success:
-            # 4. Mark as published in DB
-            cur.execute("UPDATE posts SET is_published = TRUE WHERE id = %s", (target['id'],))
+        # --- DUPLICATE HANDLING LOGIC ---
+        # If Buffer says it's a duplicate, we treat it as "Published" so we can move to the next story
+        is_duplicate = "already got this one scheduled" in str(msg).lower() or "duplicate" in str(msg).lower()
+        
+        if success or is_duplicate:
+            status_msg = "Published" if success else "Skipped (Duplicate)"
+            cur.execute("UPDATE posts SET is_published = TRUE, error_log = %s WHERE id = %s", (msg, target['id']))
             conn.commit()
             conn.close()
-            return jsonify({"status": "success", "message": f"Published: {target['title']}"}), 200
+            return jsonify({"status": "success", "message": f"{status_msg}: {target['title']}"}), 200
         else:
+            # It's a real error (e.g. API down), log it but keep is_published = False
+            cur.execute("UPDATE posts SET error_log = %s WHERE id = %s", (msg, target['id']))
+            conn.commit()
             conn.close()
             return jsonify({"status": "error", "message": f"Buffer failed: {msg}"}), 500
 
     except Exception as e:
+        if 'conn' in locals(): conn.close()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == "__main__":
