@@ -101,8 +101,12 @@ def perform_buffer_post(title, url, image_url):
       }
     }
     """
+    # Construct the text
     full_text = f"{title}\n\n{url}"
-    if len(full_text) > 280: full_text = full_text[:277] + "..."
+    
+    # Twitter limit is 280. Buffer handles some of this, but we trim to be safe.
+    if len(full_text) > 280: 
+        full_text = full_text[:277] + "..."
     
     variables = {
         "input": {
@@ -110,18 +114,28 @@ def perform_buffer_post(title, url, image_url):
             "channelId": BUFFER_CHANNEL_ID,
             "schedulingType": "automatic",
             "mode": "shareNow"
+            # REMOVED: "media" field because Buffer API rejected it as an unknown field
         }
     }
-    if image_url and image_url.startswith('http'):
-        variables["input"]["media"] = [{"url": image_url}]
-        
-    res = requests.post(BUFFER_API_URL, json={"query": mutation, "variables": variables}, headers=headers)
-    res_data = res.json()
     
-    if "errors" in res_data: return False, res_data["errors"]
-    res_body = res_data.get("data", {}).get("createPost", {})
-    if "message" in res_body: return False, res_body["message"]
-    return True, "Success"
+    # NOTE: We removed the media attachment. 
+    # Twitter/X will automatically pull the image from the URL link preview.
+        
+    try:
+        res = requests.post(BUFFER_API_URL, json={"query": mutation, "variables": variables}, headers=headers)
+        res_data = res.json()
+        
+        if "errors" in res_data: 
+            return False, res_data["errors"]
+            
+        res_body = res_data.get("data", {}).get("createPost", {})
+        if "message" in res_body: 
+            return False, res_body["message"]
+            
+        return True, "Success"
+    except Exception as e:
+        return False, str(e)
+
 
 @app.route('/')
 def dashboard():
