@@ -26,8 +26,9 @@ BUFFER_API_URL = "https://api.buffer.com"
 DATABASE_URL = os.getenv("DATABASE_URL")
 BUFFER_CHANNEL_ID = os.getenv("BUFFER_CHANNEL_ID") 
 
-# COMBINED NEWS TOPICS
+# COMBINED NEWS TOPICS (Now including BBC)
 NEWS_TOPICS = [
+    {"name": "BBC News", "params": "sources=bbc-news"},
     {"name": "Technology", "params": "category=technology"},
     {"name": "Hacking/Security", "params": "q=hacking OR 'cyber security' OR 'data breach'"},
     {"name": "Health", "params": "category=health"},
@@ -181,7 +182,7 @@ def post_news():
 def cron_publish():
     """
     Logic:
-    1. Pick a random topic from the mixed list.
+    1. Pick a random topic (BBC, Tech, Hacking, etc).
     2. Fetch news from the last 24 hours.
     3. Check database to find the first article NOT yet published.
     4. Post and mark as published.
