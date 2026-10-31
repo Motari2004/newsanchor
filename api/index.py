@@ -120,7 +120,7 @@ def dashboard():
 @app.route('/api/fetch-news')
 def fetch_news():
     try:
-        url = f"https://newsapi.org/v2/top-headlines?category=technology&language=en&apiKey={NEWS_API_KEY}"
+        url = f"https://newsapi.org/v2/top-headlines?sources=bbc-news&apiKey={NEWS_API_KEY}"
         response = requests.get(url).json()
         articles = response.get("articles", [])
         if DATABASE_URL:
