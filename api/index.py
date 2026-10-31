@@ -1,7 +1,7 @@
 import os
 import requests
 import psycopg2
-import random
+import hashlib  # Replaced random hash with stable hashlib
 from psycopg2.extras import RealDictCursor
 from flask import Flask, render_template, jsonify, request
 from dotenv import load_dotenv
@@ -9,7 +9,6 @@ from datetime import datetime, timedelta
 
 load_dotenv()
 
-# --- FOLDER LOGIC ---
 current_dir = os.path.dirname(os.path.abspath(__file__))
 template_dir = os.path.join(current_dir, '..', 'template') 
 if not os.path.exists(template_dir):
@@ -33,7 +32,6 @@ NEWS_TOPICS = [
     {"name": "Health", "params": "category=health"},
     {"name": "Kenyan News", "params": "q=Kenya OR Nairobi"},
 ]
-# ============================================================
 
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
@@ -43,11 +41,10 @@ def initialize_db():
         if not DATABASE_URL: return
         conn = get_db_connection()
         cur = conn.cursor()
-        # Added 'error_log' column to diagnose failures in the DB
         cur.execute("""
             CREATE TABLE IF NOT EXISTS posts (
                 id SERIAL PRIMARY KEY,
-                article_id BIGINT UNIQUE,
+                article_id TEXT UNIQUE, 
                 title TEXT,
                 url TEXT,
                 is_published BOOLEAN DEFAULT FALSE,
@@ -55,7 +52,6 @@ def initialize_db():
                 fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Add error_log column if it doesn't exist (for existing installs)
         try:
             cur.execute("ALTER TABLE posts ADD COLUMN error_log TEXT;")
         except:
@@ -88,12 +84,14 @@ def auto_discover_profile():
     except Exception as e:
         BUFFER_CHANNEL_ID = fallback_id
 
-# Run initialization
 initialize_db()
 auto_discover_profile()
 
+def generate_stable_id(url):
+    """Creates a unique ID that NEVER changes even if the server restarts"""
+    return hashlib.md5(url.encode('utf-8')).hexdigest()
+
 def perform_buffer_post(title, url):
-    """Logic to send a post to Buffer"""
     headers = {"Authorization": f"Bearer {BUFFER_ACCESS_TOKEN}", "Content-Type": "application/json"}
     mutation = """
     mutation CreateImmediatePost($input: CreatePostInput!) {
@@ -140,43 +138,46 @@ def fetch_news():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/cron/sync-news')
-def sync_news():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        total_saved = 0
-        
-        for topic in NEWS_TOPICS:
+def run_sync_logic():
+    """Internal function to handle syncing without making HTTP requests to itself"""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    total_saved = 0
+    for topic in NEWS_TOPICS:
+        try:
             url = f"https://newsapi.org/v2/top-headlines?{topic['params']}&language=en&apiKey={NEWS_API_KEY}"
             response = requests.get(url).json()
             articles = response.get("articles", [])
-            
             for art in articles:
                 url_link = art.get("url")
                 if not url_link: continue
-                
-                cur.execute("SELECT id FROM posts WHERE article_id = %s", (hash(url_link),))
+                stable_id = generate_stable_id(url_link)
+                cur.execute("SELECT id FROM posts WHERE article_id = %s", (stable_id,))
                 if not cur.fetchone():
                     cur.execute(
                         "INSERT INTO posts (article_id, title, url, is_published) VALUES (%s, %s, %s, %s)", 
-                        (hash(url_link), art.get("title"), url_link, False)
+                        (stable_id, art.get("title"), url_link, False)
                     )
                     total_saved += 1
-        
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success", "message": f"Synced {total_saved} new articles to database"}), 200
+        except Exception as e:
+            print(f"Error syncing topic {topic['name']}: {e}")
+    conn.commit()
+    conn.close()
+    return total_saved
+
+@app.route('/api/cron/sync-news')
+def sync_news():
+    try:
+        count = run_sync_logic()
+        return jsonify({"status": "success", "message": f"Synced {count} new articles"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/api/cron/publish-latest')
 def cron_publish():
-    """Finds ONE unposted article and handles duplicates gracefully"""
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
         one_day_ago = datetime.utcnow() - timedelta(hours=24)
         cur.execute(
             "SELECT id, title, url FROM posts WHERE is_published = FALSE AND fetched_at > %s ORDER BY fetched_at ASC LIMIT 1", 
@@ -186,10 +187,7 @@ def cron_publish():
         
         if not target:
             conn.close()
-            # Use environment variable for the base URL in production
-            base_url = request.host_url if request else "http://localhost:5000/"
-            requests.get(f"{base_url}api/cron/sync-news") 
-            
+            run_sync_logic() # Call function directly, NOT via URL
             conn = get_db_connection()
             cur = conn.cursor()
             cur.execute("SELECT id, title, url FROM posts WHERE is_published = FALSE ORDER BY fetched_at ASC LIMIT 1")
@@ -199,11 +197,7 @@ def cron_publish():
             conn.close()
             return jsonify({"status": "skipped", "message": "No news available to post"}), 200
 
-        # Post to Buffer
         success, msg = perform_buffer_post(target['title'], target['url'])
-        
-        # --- DUPLICATE HANDLING LOGIC ---
-        # If Buffer says it's a duplicate, we treat it as "Published" so we can move to the next story
         is_duplicate = "already got this one scheduled" in str(msg).lower() or "duplicate" in str(msg).lower()
         
         if success or is_duplicate:
@@ -213,7 +207,6 @@ def cron_publish():
             conn.close()
             return jsonify({"status": "success", "message": f"{status_msg}: {target['title']}"}), 200
         else:
-            # It's a real error (e.g. API down), log it but keep is_published = False
             cur.execute("UPDATE posts SET error_log = %s WHERE id = %s", (msg, target['id']))
             conn.commit()
             conn.close()
